@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>남한고 주변 측정 지도</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="shell">
+    <header class="header"><div class="logo">⌁</div><div><p class="kicker">ARDUINO FIELD MAP</p><h1>주변 환경 측정 지도</h1></div><div class="online"><i></i> 측정 대기 중</div></header>
+    <section class="intro"><div><p class="kicker">NAMHAN HIGH SCHOOL · HANAM</p><h2>측정 위치를 선택하세요</h2><p>지도에서 위치를 누른 뒤 요청하면, 측정기에서 측정한 값이 그 위치에 저장됩니다.</p></div><div class="radius-badge"><span></span> 학교 중심 반경 <b>250m</b></div></section>
+    <section class="layout">
+      <div class="map-card"><div id="map" aria-label="측정 위치 선택 지도"></div><div class="map-hint">지도를 눌러 측정할 위치를 고르세요</div></div>
+      <aside class="side-card">
+        <div class="section-title"><div><p class="kicker">NEW REQUEST</p><h3>측정 위치</h3></div><span class="step">01</span></div>
+        <div id="selection" class="selection empty-selection">지도에서 위치를 선택해 주세요.</div>
+        <button id="requestButton" class="primary" disabled>이 위치에서 측정 요청</button>
+        <p id="notice" class="notice" role="status">측정 요청을 등록하면 측정기 버튼을 눌러 값을 저장할 수 있어요.</p>
+        <div class="divider"></div>
+        <div class="section-title history-title"><div><p class="kicker">LATEST RECORDS</p><h3>요청 및 측정 기록</h3></div><button id="refresh" class="refresh" title="새로고침">↻</button></div>
+        <div id="records" class="records"><div class="no-records">아직 측정 요청이 없습니다.</div></div>
+      </aside>
+    </section>
+    <footer><span class="legend pending"></span>측정 대기 <span class="legend measured"></span>측정 완료 <small>지도 데이터 © OpenStreetMap contributors</small></footer>
+  </main>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script>
+    const CENTER = [{{ center_lat }}, {{ center_lon }}];
+    const RADIUS = 250;
+    const map = L.map('map', {zoomControl:true, scrollWheelZoom:true}).setView(CENTER, 18);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 20, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(map);
+    L.circle(CENTER, {radius:RADIUS, color:'#68a98b', weight:2, fillColor:'#94d4b4', fillOpacity:.12, dashArray:'7 7'}).addTo(map);
+    L.marker(CENTER).addTo(map).bindTooltip('남한고 중심', {permanent:true, direction:'top', offset:[0,-12]});
+    let selected = null;
+    let selectionMarker = null;
+    const selectionBox = document.getElementById('selection');
+    const requestButton = document.getElementById('requestButton');
+    const notice = document.getElementById('notice');
+
+    function distanceMeters(a, b) { return map.distance(a, b); }
+    map.on('click', event => {
+      if (distanceMeters(CENTER, event.latlng) > RADIUS) {
+        notice.textContent = '반경 250m 원 안의 위치를 선택해 주세요.';
+        notice.className = 'notice error';
+        return;
+      }
+      selected = event.latlng;
+      if (selectionMarker) map.removeLayer(selectionMarker);
+      selectionMarker = L.marker(selected).addTo(map).bindTooltip('선택한 위치', {direction:'top'}).openTooltip();
+      selectionBox.innerHTML = `위도 ${selected.lat.toFixed(6)}<br>경도 ${selected.lng.toFixed(6)}<small>학교 중심에서 ${Math.round(distanceMeters(CENTER, selected))}m</small>`;
+      selectionBox.classList.remove('empty-selection');
+      requestButton.disabled = false;
+      notice.textContent = '이 위치로 측정 요청을 등록할 수 있어요.';
+      notice.className = 'notice';
+    });
+
+    requestButton.addEventListener('click', async () => {
+      if (!selected) return;
+      requestButton.disabled = true;
+      requestButton.textContent = '요청 등록 중...';
+      try {
+        const response = await fetch('/api/requests', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({latitude:selected.lat, longitude:selected.lng})});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || '요청을 등록하지 못했습니다.');
+        notice.textContent = `요청 #${data.id} 등록 완료! 이제 측정기 버튼을 누르면 이 위치에 저장돼요.`;
+        notice.className = 'notice success';
+        await loadRecords();
+      } catch (error) {
+        notice.textContent = error.message;
+        notice.className = 'notice error';
+      } finally {
+        requestButton.textContent = '이 위치에서 측정 요청';
+        requestButton.disabled = !selected;
+      }
+    });
+
+    const markers = new Map();
+    function markerFor(item) {
+      const color = item.status === 'completed' ? '#17865e' : '#df9a2f';
+      const icon = L.divIcon({className:'', html:`<div class="pin ${item.status}"></div>`, iconSize:[20,20], iconAnchor:[10,10]});
+      const marker = L.marker([item.latitude,item.longitude], {icon});
+      const popup = item.status === 'completed'
+        ? `<b>측정 완료</b><br>온도 ${Number(item.temperature).toFixed(1)}°C<br>습도 ${Number(item.humidity).toFixed(1)}%<br><small>${item.measured_at || ''}</small>`
+        : '<b>측정 대기 중</b><br>측정기 버튼을 눌러 주세요.';
+      marker.bindPopup(popup);
+      marker.addTo(map);
+      markers.set(item.id, marker);
+    }
+    async function loadRecords() {
+      try {
+        const response = await fetch('/api/requests');
+        const data = await response.json();
+        const records = data.requests;
+        document.getElementById('records').innerHTML = records.length ? records.map(item => {
+          if (!markers.has(item.id)) markerFor(item);
+          const done = item.status === 'completed';
+          return `<button class="record ${done?'done':''}" data-id="${item.id}"><span class="record-dot ${done?'done':''}"></span><span class="record-main"><b>${done ? `${Number(item.temperature).toFixed(1)}°C · ${Number(item.humidity).toFixed(1)}%` : '측정 대기 중'}</b><small>${item.created_at} · 중심에서 ${item.distance_m}m</small></span><span class="record-arrow">›</span></button>`;
+        }).join('') : '<div class="no-records">아직 측정 요청이 없습니다.</div>';
+        document.querySelectorAll('.record').forEach(button => button.addEventListener('click', () => {
+          const marker = markers.get(Number(button.dataset.id));
+          if (marker) { map.setView(marker.getLatLng(), 19); marker.openPopup(); }
+        }));
+      } catch (error) { document.getElementById('records').innerHTML = '<div class="no-records">기록을 불러오지 못했습니다.</div>'; }
+    }
+    document.getElementById('refresh').addEventListener('click', loadRecords);
+    loadRecords();
+    setInterval(loadRecords, 5000);
+  </script>
+</body>
+</html>
