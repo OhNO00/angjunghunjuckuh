@@ -12,6 +12,9 @@ CENTER_LAT = 37.53643813
 CENTER_LON = 127.2026826
 ALLOWED_RADIUS_M = 250
 DEVICE_API_KEY = os.environ.get("DEVICE_API_KEY", "")
+DELETE_API_KEY = os.environ.get("DELETE_API_KEY") or (
+    "local-delete-key" if not os.environ.get("RENDER") else ""
+)
 app = Flask(__name__)
 
 
@@ -22,6 +25,16 @@ def device_authorized():
     supplied_key = request.headers.get("X-Device-Key", "")
     if not secrets.compare_digest(supplied_key, DEVICE_API_KEY):
         return False, (jsonify({"error": "기기 인증에 실패했습니다."}), 401)
+    return True, None
+
+
+def delete_authorized():
+    """기록 삭제에는 별도의 관리자 키를 요구합니다."""
+    if not DELETE_API_KEY:
+        return False, (jsonify({"error": "서버에 DELETE_API_KEY가 설정되지 않았습니다."}), 503)
+    supplied_key = request.headers.get("X-Delete-Key", "")
+    if not secrets.compare_digest(supplied_key, DELETE_API_KEY):
+        return False, (jsonify({"error": "삭제 인증에 실패했습니다."}), 401)
     return True, None
 
 
@@ -40,7 +53,8 @@ def initialize_database():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 temperature REAL,
-                humidity REAL
+                humidity REAL,
+                brightness REAL
             )
         """)
         columns = {row[1] for row in connection.execute("PRAGMA table_info(measurements)")}
@@ -48,6 +62,8 @@ def initialize_database():
             connection.execute("ALTER TABLE measurements ADD COLUMN latitude REAL")
         if "longitude" not in columns:
             connection.execute("ALTER TABLE measurements ADD COLUMN longitude REAL")
+        if "brightness" not in columns:
+            connection.execute("ALTER TABLE measurements ADD COLUMN brightness REAL")
         if "request_id" not in columns:
             connection.execute("ALTER TABLE measurements ADD COLUMN request_id INTEGER")
         connection.execute("""
@@ -91,7 +107,7 @@ def list_requests():
     with connect_db() as connection:
         rows = connection.execute("""
             SELECT r.id, r.latitude, r.longitude, r.status, r.created_at, r.completed_at,
-                   m.temperature, m.humidity, m.time AS measured_at
+                   m.temperature, m.humidity, m.brightness, m.time AS measured_at
             FROM measurement_requests r
             LEFT JOIN measurements m ON m.request_id = r.id
             ORDER BY r.id DESC LIMIT 100
@@ -121,6 +137,55 @@ def create_request():
         )
         request_id = cursor.lastrowid
     return jsonify({"id": request_id, "status": "pending", "message": "측정 요청을 등록했습니다."}), 201
+
+
+@app.route("/api/manual-measurements", methods=["POST"])
+def add_manual_brightness():
+    """선택한 지도 위치에 사용자가 직접 입력한 밝기를 저장합니다."""
+    data = request.get_json(silent=True) or {}
+    try:
+        latitude = float(data["latitude"])
+        longitude = float(data["longitude"])
+        brightness = float(data["brightness"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "위치와 숫자 형태의 밝기 값이 필요합니다."}), 400
+
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        return jsonify({"error": "위치 좌표가 올바르지 않습니다."}), 400
+    if brightness < 0:
+        return jsonify({"error": "밝기는 0 이상의 숫자를 입력해 주세요."}), 400
+    if distance_m(CENTER_LAT, CENTER_LON, latitude, longitude) > ALLOWED_RADIUS_M:
+        return jsonify({"error": "측정 위치는 남한고 중심 250m 범위 안에서 선택해 주세요."}), 400
+
+    with connect_db() as connection:
+        cursor = connection.execute(
+            "INSERT INTO measurement_requests (latitude, longitude, status, completed_at) "
+            "VALUES (?, ?, 'completed', CURRENT_TIMESTAMP)",
+            (latitude, longitude),
+        )
+        request_id = cursor.lastrowid
+        connection.execute(
+            "INSERT INTO measurements (brightness, latitude, longitude, request_id) VALUES (?, ?, ?, ?)",
+            (brightness, latitude, longitude, request_id),
+        )
+    return jsonify({"id": request_id, "status": "completed", "message": "밝기 값을 저장했습니다."}), 201
+
+
+@app.route("/api/requests/<int:request_id>", methods=["DELETE"])
+def delete_measurement_request(request_id):
+    """확인된 요청 한 건과 그 요청에 연결된 측정값만 삭제합니다."""
+    authorized, error_response = delete_authorized()
+    if not authorized:
+        return error_response
+    with connect_db() as connection:
+        target = connection.execute(
+            "SELECT id FROM measurement_requests WHERE id=?", (request_id,)
+        ).fetchone()
+        if target is None:
+            return jsonify({"error": "삭제할 기록을 찾을 수 없습니다."}), 404
+        connection.execute("DELETE FROM measurements WHERE request_id=?", (request_id,))
+        connection.execute("DELETE FROM measurement_requests WHERE id=?", (request_id,))
+    return jsonify({"message": "선택한 기록을 삭제했습니다."})
 
 
 @app.route("/api/device/pending", methods=["GET"])

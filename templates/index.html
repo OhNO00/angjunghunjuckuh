@@ -15,8 +15,19 @@
       <aside class="side-card">
         <div class="section-title"><div><p class="kicker">NEW REQUEST</p><h3>측정 위치</h3></div><span class="step">01</span></div>
         <div id="selection" class="selection empty-selection">지도에서 위치를 선택해 주세요.</div>
-        <button id="requestButton" class="primary" disabled>이 위치에서 측정 요청</button>
-        <p id="notice" class="notice" role="status">측정 요청을 등록하면 측정기 버튼을 눌러 값을 저장할 수 있어요.</p>
+        <div class="action-row">
+          <button id="requestButton" class="primary" disabled>측정 요청</button>
+          <button id="manualToggle" class="secondary" disabled>직접 입력</button>
+        </div>
+        <div id="manualForm" class="manual-form" hidden>
+          <label for="brightnessInput">밝기</label>
+          <div class="manual-entry">
+            <input id="brightnessInput" type="number" min="0" step="any" placeholder="밝기 숫자 입력">
+            <button id="saveBrightness" class="save-button">저장</button>
+          </div>
+          <small>선택한 위치에 밝기 값만 저장합니다.</small>
+        </div>
+        <p id="notice" class="notice" role="status">측정 요청을 보내거나, 밝기 숫자를 직접 입력할 수 있어요.</p>
         <div class="divider"></div>
         <div class="section-title history-title"><div><p class="kicker">LATEST RECORDS</p><h3>요청 및 측정 기록</h3></div><button id="refresh" class="refresh" title="새로고침">↻</button></div>
         <div id="records" class="records"><div class="no-records">아직 측정 요청이 없습니다.</div></div>
@@ -53,6 +64,7 @@
       selectionBox.innerHTML = `위도 ${selected.lat.toFixed(6)}<br>경도 ${selected.lng.toFixed(6)}<small>학교 중심에서 ${Math.round(distanceMeters(CENTER, selected))}m</small>`;
       selectionBox.classList.remove('empty-selection');
       requestButton.disabled = false;
+      document.getElementById('manualToggle').disabled = false;
       notice.textContent = '이 위치로 측정 요청을 등록할 수 있어요.';
       notice.className = 'notice';
     });
@@ -72,22 +84,75 @@
         notice.textContent = error.message;
         notice.className = 'notice error';
       } finally {
-        requestButton.textContent = '이 위치에서 측정 요청';
+        requestButton.textContent = '측정 요청';
         requestButton.disabled = !selected;
       }
     });
 
+    const manualForm = document.getElementById('manualForm');
+    document.getElementById('manualToggle').addEventListener('click', () => {
+      manualForm.hidden = !manualForm.hidden;
+      if (!manualForm.hidden) document.getElementById('brightnessInput').focus();
+    });
+    document.getElementById('saveBrightness').addEventListener('click', async () => {
+      if (!selected) return;
+      const input = document.getElementById('brightnessInput');
+      const brightness = Number(input.value);
+      if (input.value === '' || !Number.isFinite(brightness) || brightness < 0) {
+        notice.textContent = '밝기는 0 이상의 숫자로 입력해 주세요.';
+        notice.className = 'notice error';
+        return;
+      }
+      const saveButton = document.getElementById('saveBrightness');
+      saveButton.disabled = true;
+      try {
+        const response = await fetch('/api/manual-measurements', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({latitude:selected.lat, longitude:selected.lng, brightness})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || '밝기를 저장하지 못했습니다.');
+        notice.textContent = `밝기 ${brightness}를 선택한 위치에 저장했어요.`;
+        notice.className = 'notice success';
+        input.value = '';
+        manualForm.hidden = true;
+        await loadRecords();
+      } catch (error) {
+        notice.textContent = error.message;
+        notice.className = 'notice error';
+      } finally {
+        saveButton.disabled = false;
+      }
+    });
+
     const markers = new Map();
-    function markerFor(item) {
-      const color = item.status === 'completed' ? '#17865e' : '#df9a2f';
+    function markerIcon(item) {
       const icon = L.divIcon({className:'', html:`<div class="pin ${item.status}"></div>`, iconSize:[20,20], iconAnchor:[10,10]});
-      const marker = L.marker([item.latitude,item.longitude], {icon});
-      const popup = item.status === 'completed'
-        ? `<b>측정 완료</b><br>온도 ${Number(item.temperature).toFixed(1)}°C<br>습도 ${Number(item.humidity).toFixed(1)}%<br><small>${item.measured_at || ''}</small>`
+      return icon;
+    }
+    function markerPopup(item) {
+      return item.status === 'completed'
+        ? (item.brightness !== null && item.brightness !== undefined
+          ? `<b>직접 입력한 밝기</b><br>밝기 ${Number(item.brightness)}<br><small>${item.measured_at || ''}</small>`
+          : `<b>측정 완료</b><br>온도 ${Number(item.temperature).toFixed(1)}°C<br>습도 ${Number(item.humidity).toFixed(1)}%<br><small>${item.measured_at || ''}</small>`)
         : '<b>측정 대기 중</b><br>측정기 버튼을 눌러 주세요.';
-      marker.bindPopup(popup);
+    }
+    function markerFor(item) {
+      const marker = L.marker([item.latitude,item.longitude], {icon:markerIcon(item)});
+      marker.bindPopup(markerPopup(item));
+      marker._recordState = JSON.stringify([item.status, item.temperature, item.humidity, item.brightness]);
       marker.addTo(map);
       markers.set(item.id, marker);
+    }
+    function updateMarker(item) {
+      const marker = markers.get(item.id);
+      if (!marker) return markerFor(item);
+      const state = JSON.stringify([item.status, item.temperature, item.humidity, item.brightness]);
+      if (marker._recordState !== state) {
+        marker.setIcon(markerIcon(item));
+        marker.setPopupContent(markerPopup(item));
+        marker._recordState = state;
+      }
     }
     async function loadRecords() {
       try {
@@ -95,13 +160,39 @@
         const data = await response.json();
         const records = data.requests;
         document.getElementById('records').innerHTML = records.length ? records.map(item => {
-          if (!markers.has(item.id)) markerFor(item);
+          updateMarker(item);
           const done = item.status === 'completed';
-          return `<button class="record ${done?'done':''}" data-id="${item.id}"><span class="record-dot ${done?'done':''}"></span><span class="record-main"><b>${done ? `${Number(item.temperature).toFixed(1)}°C · ${Number(item.humidity).toFixed(1)}%` : '측정 대기 중'}</b><small>${item.created_at} · 중심에서 ${item.distance_m}m</small></span><span class="record-arrow">›</span></button>`;
+          const summary = item.brightness !== null && item.brightness !== undefined
+            ? `밝기 ${Number(item.brightness)}`
+            : (done ? `${Number(item.temperature).toFixed(1)}°C · ${Number(item.humidity).toFixed(1)}%` : '측정 대기 중');
+          return `<div class="record ${done?'done':''}" data-id="${item.id}"><button class="record-open" data-id="${item.id}"><span class="record-dot ${done?'done':''}"></span><span class="record-main"><b>${summary}</b><small>${item.created_at} · 중심에서 ${item.distance_m}m</small></span><span class="record-arrow">›</span></button><button class="delete-record" data-id="${item.id}" aria-label="기록 삭제">삭제</button></div>`;
         }).join('') : '<div class="no-records">아직 측정 요청이 없습니다.</div>';
-        document.querySelectorAll('.record').forEach(button => button.addEventListener('click', () => {
+        document.querySelectorAll('.record-open').forEach(button => button.addEventListener('click', () => {
           const marker = markers.get(Number(button.dataset.id));
           if (marker) { map.setView(marker.getLatLng(), 19); marker.openPopup(); }
+        }));
+        document.querySelectorAll('.delete-record').forEach(button => button.addEventListener('click', async () => {
+          const id = Number(button.dataset.id);
+          if (!confirm('이 위치에 연결된 이 기록을 삭제할까요? 삭제하면 되돌릴 수 없습니다.')) return;
+          const deleteKey = prompt('관리자 삭제 키를 입력해 주세요.');
+          if (!deleteKey) return;
+          button.disabled = true;
+          try {
+            const response = await fetch(`/api/requests/${id}`, {method:'DELETE', headers:{'X-Delete-Key':deleteKey}});
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || '삭제하지 못했습니다.');
+            const marker = markers.get(id);
+            if (marker) map.removeLayer(marker);
+            markers.delete(id);
+            notice.textContent = '선택한 기록을 삭제했어요.';
+            notice.className = 'notice success';
+            await loadRecords();
+          } catch (error) {
+            notice.textContent = error.message;
+            notice.className = 'notice error';
+          } finally {
+            button.disabled = false;
+          }
         }));
       } catch (error) { document.getElementById('records').innerHTML = '<div class="no-records">기록을 불러오지 못했습니다.</div>'; }
     }

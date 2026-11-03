@@ -14,3 +14,5 @@ services:
         value: /var/data/measurement.db
       - key: DEVICE_API_KEY
         generateValue: true
+      - key: DELETE_API_KEY
+        generateValue: true
